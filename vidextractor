@@ -1,0 +1,2474 @@
+import os
+import json
+import re
+import logging
+import ezdxf
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any, Set
+from collections import defaultdict
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+LAYER_PATTERNS = {
+    'device_id': re.compile(r'TA-DIAG-IDEN'),
+    'manufacturer': re.compile(r'TA-DIAG-MFGS'),
+    'model': re.compile(r'TA-DIAG-MODL'),
+    'rack_position': re.compile(r'TA-DIAG-RACK'),
+    'sdi_connection': re.compile(r'TA-DIAG-CONN-SDI'),
+    'hdmi_connection': re.compile(r'TA-DIAG-CONN-HDMI'),
+    'hybrid_connection': re.compile(r'TA-DIAG-CONN-Hybrid'),
+    'port_text_sdi': re.compile(r'TA-DIAG-LTXT-SDI'),
+    'port_text_hdmi': re.compile(r'TA-DIAG-LTXT-HDMI'),
+    'port_text_hybrid': re.compile(r'TA-DIAG-LTXT-Hybrid'),
+    'cable_id': re.compile(r'TA-DIAG-CNUM'),
+    'jack_id': re.compile(r'TA-DIAG-JIDN'),
+    'port_text_rf': re.compile(r'TA-DIAG-LTXT-RF'),
+    'port_text_fiber': re.compile(r'TA-DIAG-LTXT-Fiber'),
+    'cable_id_digital_video': re.compile(r'TA-DIAG-CNUM-Digital Video'),
+    'cable_id_rf': re.compile(r'TA-DIAG-CNUM-RF'),
+    'cable_id_fiber': re.compile(r'TA-DIAG-CNUM-Fiber'),
+}
+
+# Improved attribute tag mapping
+ATTRIBUTE_TAG_MAPPING = {
+    'PROD_SYSNAME': 'device_id',
+    'PROD_SYSNAME_': 'device_id',
+    'PROD_SYSNAME__': 'device_id',
+    'ID': 'device_id',
+    'NAME': 'device_id',
+    'PROD_MFG_NAME_DISPLAY': 'manufacturer',
+    'MANUFACTURER': 'manufacturer',
+    'MFG': 'manufacturer',
+    'PROD_MODEL': 'model',
+    'MODEL': 'model',
+    'RACK_NAME-RACK_POSITION': 'rack_position',
+    'RACK': 'rack_position',
+    'CONN_NAME': 'connector_type',
+    'CONN_NAME_': 'connector_type',
+    'PORT': 'connector_type',
+    'LINE_TEXT': 'port_name',
+    'LINE_TEXT_': 'port_name',
+    'PORT_NAME': 'port_name'
+}
+
+# Constants for pattern matching
+DEVICE_PATTERNS = [
+    # Standard device naming patterns
+    re.compile(r'^([A-Za-z]+\.[0-9]+)$'),           # CCU.01, VSRV.01
+    re.compile(r'^([A-Za-z0-9_-]+\.[0-9]+)$'),      # UDX.01, SDA.01
+    re.compile(r'^([A-Z]{2,}[0-9]*)$'),             # RTR, ME1, ULTRIX
+    re.compile(r'^(RACK[0-9]+-[0-9]+(?:,[0-9]+)?)$'), # RACK1-15,5
+    # Specific broadcast equipment types
+    re.compile(r'^(CAM\.[0-9]+)$'),                 # Camera
+    re.compile(r'^(CCU\.[0-9]+)$'),                 # Camera Control Unit
+    re.compile(r'^(MON\.[0-9]+)$'),                 # Monitor
+    re.compile(r'^(SDA\.[0-9]+)$'),                 # SDI Distribution Amplifier
+    re.compile(r'^(VDA\.[0-9]+)$'),                 # Video Distribution Amplifier
+    re.compile(r'^(FSYN\.[0-9]+)$'),                # Frame Sync
+    re.compile(r'^(FRX\.[0-9]+)$'),                 # Fiber Receiver
+    re.compile(r'^(FTRX\.[0-9]+)$'),                # Fiber Transceiver
+    re.compile(r'^(CONV\.[0-9]+)$'),                # Converter
+    re.compile(r'^(EMB\.[0-9]+)$'),                 # Embedder
+    re.compile(r'^(DEMB)$'),                        # De-embedder
+    re.compile(r'^(PANEL\.[0-9]+)$'),               # Panel
+    re.compile(r'^(VPP\.[0-9]+)$'),                 # Video Patch Panel
+    re.compile(r'^(VTP\.[0-9]+)$'),                 # Video Tie Panel
+    re.compile(r'^(PLAY[0-9]+)$'),                  # Playback device
+    re.compile(r'^(DVR\.[0-9]+)$'),                 # Digital Video Recorder
+    re.compile(r'^(EXT[0-9]+)$'),                   # External source
+    re.compile(r'^(AUDPC)$'),                       # Audio PC
+    re.compile(r'^(VSW)$'),                         # Video Switcher
+    re.compile(r'^(CGEN)$'),                        # Character Generator
+    re.compile(r'^(SPG)$'),                         # Sync Pulse Generator
+    re.compile(r'^(WFM)$'),                         # Waveform Monitor
+    re.compile(r'^(TX\.[0-9]+)$'),                  # Transmitter
+    re.compile(r'^(IPENC)$'),                       # IP Encoder
+    re.compile(r'^(TVRX)$'),                        # TV Receiver
+    re.compile(r'^(HTP)$'),                         # Hybrid Tie Panel
+    re.compile(r'^(AUD)$'),                         # Audio
+    re.compile(r'^(AMU)$'),                         # Audio Monitoring Unit
+    re.compile(r'^(DISPL\.[0-9]+)$'),               # Display
+    re.compile(r'^(CO)$'),                          # Changeover unit
+    re.compile(r'^(METER)$'),                       # Meter/Measuring device
+    re.compile(r'^(TV\.(?:ANT|BOOST))$'),           # TV Antenna/Booster
+]
+
+# Common manufacturers in broadcast industry
+MANUFACTURERS = {
+    'SONY', 'ROSS', 'BLACKMAGIC', 'AJA', 'TELESTREAM', 'KONVISION', 
+    'DELL', 'ARTEL', 'COURTYARD', 'LYNX', 'TVC', 'HAIVISION', 'NEWBURY',
+    'GENERIC', 'UNISPECTRA', 'CABLETECH', 'RTW'
+}
+
+# Port patterns
+PORT_PATTERNS = [
+    re.compile(r'^(BNC)$'),                         # BNC connector
+    re.compile(r'^(HD-BNC)$'),                      # HD-BNC connector
+    re.compile(r'^(SDI[- ](?:IN|OUT)[0-9]*)$'),     # SDI IN/OUT
+    re.compile(r'^((?:IN|OUT)[0-9A-Z]*)$'),         # Generic IN/OUT
+    re.compile(r'^((?:IN|OUT)[0-9]+-[0-9]+)$'),     # Matrix ports like IN01-01
+    re.compile(r'^(HDMI(?: IN| OUT)?)$'),           # HDMI ports
+    re.compile(r'^(HDMI[0-9])$'),                   # HDMI1, HDMI2, etc.
+    re.compile(r'^(DVI-[ID](?: IN| OUT)?)$'),       # DVI ports
+    re.compile(r'^(DP[0-9]*)$'),                    # DisplayPort
+    re.compile(r'^(MINIDP MDP[0-9]*)$'),            # Mini DisplayPort
+    re.compile(r'^(USB-C)$'),                       # USB-C
+    re.compile(r'^(OPT[0-9]*)$'),                   # Optical
+    re.compile(r'^(LC(?: RX| TX)?)$'),              # LC fiber connectors
+    re.compile(r'^(ST)$'),                          # ST fiber connector
+    re.compile(r'^(F(?: IN| OUT[0-9]*)?)$'),        # F-type connector (RF)
+    re.compile(r'^(ANT)$'),                         # Antenna
+    re.compile(r'^(LOOP)$'),                        # Loop through
+    re.compile(r'^(MV[0-9]*)$'),                    # Multiviewer output
+    re.compile(r'^(MVI/O[0-9]*)$'),                 # Multiviewer I/O
+    re.compile(r'^(CAM)$'),                         # Camera input
+    re.compile(r'^(PM[0-9])$'),                     # Program Monitor
+    re.compile(r'^(RET[0-9])$'),                    # Return feed
+    re.compile(r'^(KEY[0-9])$'),                    # Keyer
+    re.compile(r'^(FILL[0-9])$'),                   # Fill
+    re.compile(r'^(CH[A-Z])$'),                     # Channel A-Z
+    re.compile(r'^(JR[0-9])$'),                     # Jack reference
+    re.compile(r'^(FUW)$'),                         # Female connector
+    re.compile(r'^(PUW)$'),                         # Male connector
+    re.compile(r'^(FMW)$'),                         # Female connector
+    re.compile(r'^(MON)$'),                         # Monitor
+    re.compile(r'^(5G-ANT[0-9])$'),                 # 5G Antenna
+    re.compile(r'^(QV-[A-Z]+)$'),                   # Preview feed
+    re.compile(r'^(THROUGH)$'),                     # Through connection
+]
+
+# Cable ID patterns by type
+CABLE_ID_PATTERNS = {
+    'SDI': re.compile(r'^DV[0-9]{4,}$'),            # Digital Video cables
+    'HYBRID': re.compile(r'^HB[0-9]{4,}$'),         # Hybrid camera cables
+    'FIBER': re.compile(r'^FB[0-9]{4,}$'),          # Fiber cables
+    'SYNC': re.compile(r'^SY[0-9]{4,}$'),           # Sync/Reference cables
+    'RF': re.compile(r'^RF[0-9]{4,}$'),             # RF cables
+    'DISPLAY': re.compile(r'^DP[0-9]{4,}$'),        # Display cables
+    'AUDIO': re.compile(r'^AU[0-9]{4,}$'),          # Audio cables
+    'HDMI': re.compile(r'^HD[0-9]{4,}$'),           # HDMI cables
+    'CONTROL': re.compile(r'^CT[0-9]{4,}$'),        # Control cables
+    'POWER': re.compile(r'^PW[0-9]{4,}$'),          # Power cables
+    'COMPOSITE': re.compile(r'^VA[0-9]{4,}$'),      # Composite cables
+}
+
+# Improved cable ID detection for common formats in broadcast schematics
+def is_cable_id(text):
+    """Check if text is a cable ID based on common formats"""
+    # Check for standard prefixed cable IDs (DV, HB, FB, etc.)
+    for pattern in CABLE_ID_PATTERNS.values():
+        if pattern.match(text):
+            return True
+    
+    # Additional formats often seen in broadcast schematics
+    # 1. Simple numeric format (e.g., 0001, 0002)
+    if re.match(r'^[0-9]{4,}$', text):
+        return True
+    
+    # 2. Shorter formats sometimes used for video (DV001, DV01, etc.)
+    if re.match(r'^[A-Z]{2}[0-9]{1,4}$', text):
+        return True
+    
+    return False
+
+def get_layer_info(layer_name):
+    """Extract detailed information from layer name"""
+    info = {
+        'signal_type': 'UNKNOWN',
+        'layer_type': 'UNKNOWN'
+    }
+    
+    # Check for layer type
+    if 'DIAG-IDEN' in layer_name:
+        info['layer_type'] = 'IDENTIFIER'
+    elif 'DIAG-CONN' in layer_name:
+        info['layer_type'] = 'CONNECTOR'
+    elif 'DIAG-LTXT' in layer_name:
+        info['layer_type'] = 'PORT_TEXT'
+    elif 'DIAG-CNUM' in layer_name:
+        info['layer_type'] = 'CABLE_ID'
+    elif 'DIAG-MFGS' in layer_name:
+        info['layer_type'] = 'MANUFACTURER'
+    elif 'DIAG-MODL' in layer_name:
+        info['layer_type'] = 'MODEL'
+    elif 'DIAG-RACK' in layer_name:
+        info['layer_type'] = 'RACK'
+    elif 'DIAG-JIDN' in layer_name:
+        info['layer_type'] = 'JACK_ID'
+    
+    # Extract signal type from layer name
+    if '-SDI' in layer_name:
+        info['signal_type'] = 'SDI'
+    elif '-HDMI' in layer_name:
+        info['signal_type'] = 'HDMI'
+    elif '-HYBRID' in layer_name:
+        info['signal_type'] = 'HYBRID'
+    elif '-FIBER' in layer_name or '-FIBRE' in layer_name:
+        info['signal_type'] = 'FIBER'
+    elif '-RF' in layer_name:
+        info['signal_type'] = 'RF'
+    elif '-DIGITAL VIDEO' in layer_name:
+        info['signal_type'] = 'DIGITAL VIDEO'
+    elif '-AUDIO' in layer_name:
+        info['signal_type'] = 'AUDIO'
+    
+    return info    
+
+# Helper functions for processing DXF files
+def find_nearest_device(position, devices, max_distance=10.0):
+    """Find the nearest device to a position"""
+    nearest_device = None
+    min_distance = max_distance
+    
+    for device_id, device_data in devices.items():
+        if 'position' in device_data:
+            distance = calculate_distance(position, device_data['position'])
+            if distance < min_distance:
+                min_distance = distance
+                nearest_device = device_id
+    
+    return nearest_device
+
+def find_nearest_cable_id(position, cable_ids, max_distance=10.0):
+    """Find the nearest cable ID to a position"""
+    nearest_cable = None
+    min_distance = max_distance
+    
+    for cable_id, cable_data in cable_ids.items():
+        if 'position' in cable_data:
+            distance = calculate_distance(position, cable_data['position'])
+            if distance < min_distance:
+                min_distance = distance
+                nearest_cable = cable_id
+    
+    return nearest_cable
+
+def calculate_distance(point1, point2):
+    """Calculate distance between two points"""
+    return ((point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2) ** 0.5
+
+def calculate_midpoint(point1, point2):
+    """Calculate midpoint between two points"""
+    return ((point1[0] + point2[0]) / 2, (point1[1] + point2[1]) / 2)
+
+def identify_endpoint(point, devices, device_positions, text_entities, max_distance=20.0):
+    """Identify what's at a given endpoint (device, port, etc.)"""
+    # First check if it's near a known device position
+    nearest_device = None
+    min_distance = max_distance
+    
+    for device_id, device_data in devices.items():
+        if 'position' in device_data:
+            distance = calculate_distance(point, device_data['position'])
+            if distance < min_distance:
+                min_distance = distance
+                nearest_device = device_id
+    
+    if nearest_device:
+        # Check if it's near a port of this device
+        device_ports = devices[nearest_device].get('ports', {})
+        nearest_port = None
+        min_port_distance = max_distance
+        
+        for port_name, port_data in device_ports.items():
+            if 'position' in port_data:
+                distance = calculate_distance(point, port_data['position'])
+                if distance < min_port_distance:
+                    min_port_distance = distance
+                    nearest_port = port_name
+        
+        if nearest_port:
+            return {
+                'type': 'device',
+                'id': nearest_device,
+                'port': nearest_port
+            }
+        else:
+            return {
+                'type': 'device',
+                'id': nearest_device
+            }
+    
+    # Check if it's near any text that might be a device or port
+    nearest_text = None
+    min_text_distance = max_distance
+    
+    for text_entity in text_entities:
+        if 'position' in text_entity:
+            distance = calculate_distance(point, text_entity['position'])
+            if distance < min_text_distance:
+                min_text_distance = distance
+                nearest_text = text_entity
+    
+    if nearest_text:
+        text = nearest_text.get('text', '')
+        
+        # Check if it's a device
+        for pattern in DEVICE_PATTERNS:
+            match = pattern.match(text)
+            if match:
+                device_id = match.group(1)
+                return {
+                    'type': 'device',
+                    'id': device_id
+                }
+        
+        # Check if it's a port
+        for pattern in PORT_PATTERNS:
+            match = pattern.match(text)
+            if match:
+                port_name = match.group(1)
+                
+                # Try to find the device this port belongs to
+                nearest_device_for_port = find_nearest_device(nearest_text['position'], devices, max_distance=30.0)
+                
+                if nearest_device_for_port:
+                    return {
+                        'type': 'device',
+                        'id': nearest_device_for_port,
+                        'port': port_name
+                    }
+                else:
+                    return {
+                        'type': 'port',
+                        'name': port_name
+                    }
+    
+    # If we couldn't identify anything, return None
+    return None
+
+def normalize_positions(position_data, epsilon=0.5):
+    """Normalize positions that are very close to each other"""
+    if not position_data:
+        return position_data
+        
+    # Group by close positions
+    position_groups = []
+    for pos in position_data:
+        # Check if this position is close to an existing group
+        found_group = False
+        for group in position_groups:
+            if any(calculate_distance(pos, group_pos) < epsilon for group_pos in group):
+                group.append(pos)
+                found_group = True
+                break
+        
+        if not found_group:
+            # Start a new group
+            position_groups.append([pos])
+    
+    # Calculate average position for each group
+    normalized_positions = []
+    for group in position_groups:
+        if len(group) == 1:
+            normalized_positions.append(group[0])
+        else:
+            # Calculate average position
+            avg_x = sum(pos[0] for pos in group) / len(group)
+            avg_y = sum(pos[1] for pos in group) / len(group)
+            normalized_positions.append((avg_x, avg_y))
+
+    return normalized_positions
+
+def derive_signal_type(layer_name):
+    """Basic signal type derivation from layer name"""
+    layer_name = layer_name.upper()
+    
+    if 'VIDEO' in layer_name or 'SDI' in layer_name:
+        return 'SDI'
+    elif 'FIBER' in layer_name or 'FIBRE' in layer_name:
+        return 'FIBER'
+    elif 'AUDIO' in layer_name:
+        return 'AUDIO'
+    elif 'CONTROL' in layer_name:
+        return 'CONTROL'
+    elif 'INTERCOM' in layer_name:
+        return 'INTERCOM'
+    elif 'POWER' in layer_name:
+        return 'POWER'
+    elif 'RF' in layer_name:
+        return 'RF'
+    elif 'SYNC' in layer_name:
+        return 'SYNC'
+    elif 'HYBRID' in layer_name:
+        return 'HYBRID'
+    elif 'HDMI' in layer_name:
+        return 'HDMI'
+    elif 'DISPLAY' in layer_name or 'DVI' in layer_name:
+        return 'DISPLAY'
+    else:
+        return 'UNKNOWN'    
+
+def process_cable_associations(devices, cable_ids):
+    """Process cable IDs and associate them with device ports"""
+    # Group cable IDs by their base ID to handle duplicates
+    cable_groups = defaultdict(list)
+    for cable_id, cable_data in cable_ids.items():
+        cable_groups[cable_id].append(cable_data)
+    
+    # Process each cable group
+    for cable_id, cable_instances in cable_groups.items():
+        # Determine signal type from the first instance's layer
+        signal_type = 'UNKNOWN'
+        if cable_instances:
+            layer = cable_instances[0].get('layer', '')
+            signal_type = derive_signal_type_from_layer(layer)
+        
+        # Create a list of all positions for this cable ID
+        cable_positions = [instance['position'] for instance in cable_instances 
+                          if 'position' in instance]
+        
+        # Find device ports near any of these cable positions
+        for device_id, device_data in devices.items():
+            for port_name, port_data in device_data.get('ports', {}).items():
+                port_pos = port_data.get('position')
+                if not port_pos:
+                    continue
+                
+                # Check distance to any cable position
+                for cable_pos in cable_positions:
+                    dist = calculate_distance(port_pos, cable_pos)
+                    if dist < 20.0:  # Adjust threshold as needed
+                        # Associate this cable with this port
+                        port_data['cable_id'] = cable_id
+                        port_data['cable_type'] = signal_type
+                        break 
+
+def process_device_blocks(block_attributes, devices):
+    """Process blocks that represent complete devices"""
+    # Group attributes by their spatial proximity
+    spatial_groups = defaultdict(list)
+    
+    for block_name, block_data in block_attributes.items():
+        position_key = (int(block_data['position'][0]/10), int(block_data['position'][1]/10))
+        spatial_groups[position_key].append((block_name, block_data))
+    
+    # Process each spatial group to find device blocks and their ports
+    for position_key, blocks in spatial_groups.items():
+        # Find device ID blocks
+        device_blocks = [b for b in blocks if 'device_id' in b[1]['attributes']]
+        
+        if not device_blocks:
+            continue
+            
+        # Use the first device block as the main device
+        main_block_name, main_block_data = device_blocks[0]
+        device_id = main_block_data['attributes']['device_id']['text']
+        
+        if not device_id:
+            continue
+            
+        # Create or update device entry
+        if device_id not in devices:
+            devices[device_id] = {
+                'id': device_id,
+                'position': main_block_data['position'],
+                'layer': main_block_data['layer'],
+                'block': main_block_name,
+                'ports': {}
+            }
+        
+        # Add other properties from the main block
+        for attr_type in ['manufacturer', 'model', 'rack_position']:
+            if attr_type in main_block_data['attributes']:
+                devices[device_id][attr_type] = main_block_data['attributes'][attr_type]['text']
+        
+        # Find port blocks in the same spatial group
+        for block_name, block_data in blocks:
+            if 'connector_type' in block_data['attributes'] and 'port_name' in block_data['attributes']:
+                conn_type = block_data['attributes']['connector_type']['text']
+                port_name = block_data['attributes']['port_name']['text']
+                
+                # Add port to the device
+                port_key = f"{conn_type} {port_name}".strip()
+                devices[device_id]['ports'][port_key] = {
+                    'name': port_key,
+                    'connector_type': conn_type,
+                    'port_text': port_name,
+                    'position': block_data['position'],
+                    'layer': block_data['attributes']['connector_type']['layer']
+                }         
+
+def process_compound_device_names(devices, text_entities):
+    """Process compound device names like 'FRX.01|FRX.02|FTRX.01'"""
+    compound_devices = {}
+    
+    # Find all device entries with pipe-separated names
+    for device_id, device_data in list(devices.items()):
+        if '|' in device_id:
+            # This is a compound device
+            compound_devices[device_id] = device_data
+            # Remove the compound entry
+            del devices[device_id]
+    
+    # Process each compound device
+    for compound_id, compound_data in compound_devices.items():
+        # Split the ID into individual device IDs
+        individual_ids = [id.strip() for id in compound_id.split('|')]
+        position = compound_data.get('position')
+        
+        for individual_id in individual_ids:
+            # Create or update individual device entries
+            if individual_id not in devices:
+                # Copy the compound data but update the ID
+                devices[individual_id] = {
+                    'id': individual_id,
+                    'position': position,
+                    'layer': compound_data.get('layer'),
+                    'source': compound_data.get('source'),
+                    'text': individual_id,
+                    'ports': {},
+                    'part_of_compound': compound_id
+                }
+            
+            # Look for ports that might belong to this individual device
+            for text_entity in text_entities:
+                if (text_entity.get('type') == 'ATTRIB' and 
+                    'position' in text_entity and 
+                    calculate_distance(position, text_entity['position']) < 30.0):
+                    
+                    # Check if this is a port for the individual device
+                    text = text_entity.get('text', '')
+                    if individual_id in text and any(pattern.match(text) for pattern in PORT_PATTERNS):
+                        port_name = text.replace(individual_id, '').strip()
+                        devices[individual_id]['ports'][port_name] = {
+                            'name': port_name,
+                            'position': text_entity['position'],
+                            'text': text
+                        }             
+
+def derive_signal_type_from_layer(layer_name):
+    """Derive signal type from detailed layer information"""
+    layer_name = layer_name.upper()
+    
+    if 'CONN-SDI' in layer_name:
+        return 'SDI'
+    elif 'CONN-HDMI' in layer_name:
+        return 'HDMI'
+    elif 'CONN-HYBRID' in layer_name:
+        return 'HYBRID'
+    elif 'CONN-FIBER' in layer_name or 'CONN-FIBRE' in layer_name:
+        return 'FIBER'
+    elif '-DIGITAL VIDEO' in layer_name:
+        return 'DIGITAL VIDEO'
+    elif '-AUDIO' in layer_name:
+        return 'AUDIO'
+    
+    # Extract signal type from CNUM layer if present
+    if 'CNUM-' in layer_name:
+        parts = layer_name.split('CNUM-')
+        if len(parts) > 1 and parts[1]:
+            return parts[1].strip()
+    
+    return derive_signal_type(layer_name)  # Fall back to previous method 
+
+def derive_signal_type_from_visual(entity):
+    """Derive signal type from visual properties"""
+    # DXF color indices often indicate signal types
+    color_index = getattr(entity.dxf, 'color', 0)
+    
+    if color_index == 2:  # Yellow
+        return 'SDI'
+    elif color_index == 1:  # Red
+        return 'HDMI'
+    elif color_index == 5:  # Blue
+        return 'FIBER'
+    elif color_index == 3:  # Green
+        return 'HYBRID'
+    
+    # If we couldn't determine from color, try the layer
+    if hasattr(entity, 'dxf') and hasattr(entity.dxf, 'layer'):
+        return derive_signal_type_from_layer(entity.dxf.layer)
+    
+    return 'UNKNOWN'    
+
+def deduplicate_entities(entities, epsilon=0.5):
+    """
+    Deduplicate entities that are at the same or very close positions
+    with the same text content
+    """
+    # Create spatial hash
+    spatial_hash = defaultdict(list)
+    for entity in entities:
+        if 'position' in entity:
+            # Use a grid with cells of size epsilon
+            grid_x = int(entity['position'][0] / epsilon)
+            grid_y = int(entity['position'][1] / epsilon)
+            spatial_hash[(grid_x, grid_y)].append(entity)
+    
+    # Process each cell to find duplicates
+    unique_entities = []
+    processed = set()
+    
+    for cell, cell_entities in spatial_hash.items():
+        for i, entity in enumerate(cell_entities):
+            if i in processed:
+                continue
+                
+            # Add this entity to unique list
+            unique_entities.append(entity)
+            processed.add(i)
+            
+            # Check remaining entities in this cell and adjacent cells
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    neighbor_cell = (cell[0] + dx, cell[1] + dy)
+                    if neighbor_cell not in spatial_hash:
+                        continue
+                        
+                    for j, other in enumerate(spatial_hash[neighbor_cell]):
+                        if j in processed:
+                            continue
+                            
+                        # Check if they're duplicates (same text, close position)
+                        if (entity.get('text') == other.get('text') and
+                            calculate_distance(entity['position'], other['position']) < epsilon):
+                            processed.add(j)
+    
+    return unique_entities
+
+def extract_visual_elements(dxf_file_path, schematic_data):
+    """Extract visual elements like lines, polylines, and their styles"""
+    doc = ezdxf.readfile(dxf_file_path)
+    msp = doc.modelspace()
+    
+    # Extract line colors and styles
+    visual_elements = {
+        'lines': [],
+        'polylines': [],
+        'boxes': [],
+        'text_styles': []
+    }
+    
+    # Process lines with their visual properties
+    for entity in msp.query('LINE'):
+        try:
+            visual_line = {
+                'start': (entity.dxf.start.x, entity.dxf.start.y),
+                'end': (entity.dxf.end.x, entity.dxf.end.y),
+                'color': entity.dxf.color,
+                'layer': entity.dxf.layer,
+                'linetype': getattr(entity.dxf, 'linetype', 'CONTINUOUS'),
+                'lineweight': getattr(entity.dxf, 'lineweight', 0)
+            }
+            visual_elements['lines'].append(visual_line)
+        except Exception as e:
+            logger.debug(f"Error processing visual LINE: {str(e)}")
+    
+    # Process polylines with their visual properties
+    for entity in msp.query('LWPOLYLINE'):
+        try:
+            points = list(entity.vertices())
+            visual_polyline = {
+                'points': points,
+                'color': entity.dxf.color,
+                'layer': entity.dxf.layer,
+                'linetype': getattr(entity.dxf, 'linetype', 'CONTINUOUS'),
+                'lineweight': getattr(entity.dxf, 'lineweight', 0),
+                'is_closed': getattr(entity.dxf, 'flags', 0) & 1  # Check if closed polyline
+            }
+            visual_elements['polylines'].append(visual_polyline)
+        except Exception as e:
+            logger.debug(f"Error processing visual POLYLINE: {str(e)}")
+    
+    # Process blocks that represent equipment boxes
+    for block_ref in msp.query('INSERT'):
+        try:
+            box = {
+                'name': block_ref.dxf.name,
+                'position': (block_ref.dxf.insert.x, block_ref.dxf.insert.y),
+                'rotation': getattr(block_ref.dxf, 'rotation', 0),
+                'x_scale': getattr(block_ref.dxf, 'xscale', 1),
+                'y_scale': getattr(block_ref.dxf, 'yscale', 1),
+                'layer': block_ref.dxf.layer
+            }
+            visual_elements['boxes'].append(box)
+        except Exception as e:
+            logger.debug(f"Error processing visual BLOCK: {str(e)}")
+    
+    # Add metadata if available
+    if hasattr(doc, 'header') and hasattr(doc.header, 'custom_vars'):
+        visual_elements['metadata'] = dict(doc.header.custom_vars)
+    
+    # Add this visual data to the schematic data
+    schematic_data['visual_elements'] = visual_elements
+    return schematic_data    
+
+def extract_broadcast_schematic(dxf_file_path):
+    """
+    Extract broadcast schematic data from a DXF file
+    """
+    logger.info(f"Processing {dxf_file_path}")
+    
+    # Data structures
+    devices = {}               # Device information
+    device_positions = {}      # Map positions to device IDs
+    cable_ids = {}             # Cable ID information
+    ports = defaultdict(dict)  # Port information by device
+    connections = []           # Connection information
+    text_entities = []         # All text entities for reference
+    jack_entries = []          # For patch panel jacks
+    block_attributes = defaultdict(dict)  # Group attributes by their block
+    
+    try:
+        # Load the DXF file
+        doc = ezdxf.readfile(dxf_file_path)
+        msp = doc.modelspace()
+        
+        # Step 1: Extract all text entities, attributes, and blocks
+        logger.info("Extracting text entities and attributes...")
+        
+        # Process TEXT entities
+        for entity in msp.query('TEXT'):
+            try:
+                text = entity.dxf.text.strip()
+                if not text:
+                    continue
+                
+                position = (entity.dxf.insert.x, entity.dxf.insert.y)
+                layer = entity.dxf.layer
+                height = getattr(entity.dxf, 'height', 1.0)
+                rotation = getattr(entity.dxf, 'rotation', 0.0)
+                
+                text_entity = {
+                    'type': 'TEXT',
+                    'text': text,
+                    'position': position,
+                    'layer': layer,
+                    'height': height,
+                    'rotation': rotation
+                }
+                text_entities.append(text_entity)
+                
+                # Check if this is potentially a device identifier
+                for pattern in DEVICE_PATTERNS:
+                    match = pattern.match(text)
+                    if match:
+                        device_id = match.group(1)
+                        devices[device_id] = {
+                            'id': device_id,
+                            'position': position,
+                            'layer': layer,
+                            'source': 'TEXT',
+                            'text': text,
+                            'ports': {}
+                        }
+                        device_positions[position] = device_id
+                        break
+                
+                # Check if this is a manufacturer
+                if text in MANUFACTURERS:
+                    # Find closest device to associate with this manufacturer
+                    nearest_device = find_nearest_device(position, devices, 10.0)
+                    if nearest_device:
+                        devices[nearest_device]['manufacturer'] = text
+                
+                # Check for cable IDs
+                if is_cable_id(text):
+                    cable_type = "UNKNOWN"
+                    for ctype, pattern in CABLE_ID_PATTERNS.items():
+                        if pattern.match(text):
+                            cable_type = ctype
+                            break
+                    
+                    cable_ids[text] = {
+                        'id': text,
+                        'position': position,
+                        'layer': layer,
+                        'type': cable_type
+                    }
+                    
+                # Check for port identifiers
+                for pattern in PORT_PATTERNS:
+                    if pattern.match(text):
+                        port_name = text
+                        # Try to find closest device to associate this port with
+                        nearest_device = find_nearest_device(position, devices, 20.0)
+                        if nearest_device:
+                            ports[nearest_device][port_name] = {
+                                'name': port_name,
+                                'position': position,
+                                'text': text
+                            }
+                        break
+            except Exception as e:
+                logger.debug(f"Error processing TEXT entity: {str(e)}")
+        
+        # Process MTEXT entities (multi-line text)
+        for entity in msp.query('MTEXT'):
+            try:
+                text = entity.text
+                if not text:
+                    continue
+                
+                position = (entity.dxf.insert.x, entity.dxf.insert.y)
+                layer = entity.dxf.layer
+                height = getattr(entity.dxf, 'height', 1.0)
+                rotation = getattr(entity.dxf, 'rotation', 0.0)
+                
+                # Clean up control codes in MTEXT
+                text = text.replace('\\C1;', '')
+                
+                # Split MTEXT into lines and process each line
+                lines = re.split(r'\\P', text)
+                cleaned_lines = [line.strip() for line in lines if line.strip()]
+                
+                text_entity = {
+                    'type': 'MTEXT',
+                    'text': text,
+                    'position': position,
+                    'layer': layer,
+                    'height': height,
+                    'rotation': rotation,
+                    'lines': cleaned_lines
+                }
+                text_entities.append(text_entity)
+                
+                # Process each line for potential device IDs or ports
+                for i, line in enumerate(cleaned_lines):
+                    clean_line = line.strip()
+                    if not clean_line:
+                        continue
+                    
+                    # Check for device IDs
+                    device_match = False
+                    for pattern in DEVICE_PATTERNS:
+                        match = pattern.match(clean_line)
+                        if match:
+                            device_id = match.group(1)
+                            if device_id not in devices:
+                                devices[device_id] = {
+                                    'id': device_id,
+                                    'position': position,
+                                    'layer': layer,
+                                    'source': 'MTEXT',
+                                    'text': clean_line,
+                                    'ports': {}
+                                }
+                            device_match = True
+                            break
+                    
+                    # Check for port designations if not a device
+                    if not device_match:
+                        for pattern in PORT_PATTERNS:
+                            match = pattern.match(clean_line)
+                            if match:
+                                port_name = match.group(1)
+                                # Try to find closest device to associate this port with
+                                nearest_device = find_nearest_device(position, devices, 20.0)
+                                if nearest_device:
+                                    ports[nearest_device][port_name] = {
+                                        'name': port_name,
+                                        'position': position,
+                                        'text': clean_line
+                                    }
+                                break
+                        
+                        # Check for cable IDs
+                        if is_cable_id(clean_line):
+                            cable_type = "UNKNOWN"
+                            for ctype, pattern in CABLE_ID_PATTERNS.items():
+                                if pattern.match(clean_line):
+                                    cable_type = ctype
+                                    break
+                            
+                            cable_ids[clean_line] = {
+                                'id': clean_line,
+                                'position': position,
+                                'layer': layer,
+                                'type': cable_type
+                            }
+            except Exception as e:
+                logger.debug(f"Error processing MTEXT entity: {str(e)}")        
+
+        # After all TEXT and MTEXT processing, add:
+        logger.info("Deduplicating text entities...")
+        text_entities = deduplicate_entities(text_entities)    
+        
+        # Process block references and attributes
+        for block_ref in msp.query('INSERT'):
+            try:
+                block_position = (block_ref.dxf.insert.x, block_ref.dxf.insert.y)
+                block_name = block_ref.dxf.name
+                
+                # Extract attributes from this block
+                device_id = None
+                manufacturer = None
+                model = None
+                rack_position = None
+                conn_name = None
+                port_texts = []
+                
+                if hasattr(block_ref, 'attribs'):
+                    # Create an entry for this block in block_attributes
+                    if block_name not in block_attributes:
+                        block_attributes[block_name] = {
+                            'position': block_position,
+                            'layer': block_ref.dxf.layer,
+                            'attributes': {}
+                        }
+                    
+                    for attrib in block_ref.attribs:
+                        try:
+                            tag = attrib.dxf.tag
+                            text = attrib.dxf.text.strip()
+                            if not text:
+                                continue
+                                
+                            attrib_position = (attrib.dxf.insert.x, attrib.dxf.insert.y)
+                            layer = attrib.dxf.layer
+                            
+                            # Record all attributes
+                            attrib_entity = {
+                                'type': 'ATTRIB',
+                                'block': block_name,
+                                'tag': tag,
+                                'text': text,
+                                'position': attrib_position,
+                                'layer': layer
+                            }
+                            text_entities.append(attrib_entity)
+                            
+                            # Map the tag to a standard category if possible
+                            category = ATTRIBUTE_TAG_MAPPING.get(tag, tag)
+                            
+                            # Store with the original tag for reference
+                            block_attributes[block_name]['attributes'][category] = {
+                                'text': text,
+                                'position': attrib_position,
+                                'layer': layer,
+                                'original_tag': tag
+                            }
+
+                            layer_info = get_layer_info(layer)
+                            category = ATTRIBUTE_TAG_MAPPING.get(tag, tag)
+
+                            if layer_info['layer_type'] == 'CABLE_ID':
+                                # This is a cable ID
+                                # Process cable ID
+                                cable_type = layer_info['signal_type']
+                                # etc.
+                            elif layer_info['layer_type'] == 'CONNECTOR':
+                                # This is a connector
+                                connector_type = layer_info['signal_type']
+                            
+                            # Process attribute based on tag
+                            if tag in ('PROD_SYSNAME', 'PROD_SYSNAME_', 'PROD_SYSNAME__', 'ID', 'NAME', 'device_id'):
+                                # This is likely a device ID
+                                for pattern in DEVICE_PATTERNS:
+                                    if pattern.match(text):
+                                        device_id = text
+                                        if device_id not in devices:
+                                            devices[device_id] = {
+                                                'id': device_id,
+                                                'position': attrib_position,
+                                                'layer': layer,
+                                                'source': 'ATTRIB',
+                                                'text': text,
+                                                'block': block_name,
+                                                'ports': {}
+                                            }
+                                        device_positions[attrib_position] = device_id
+                                        break
+                                
+                                # Process compound device names (multiple devices in one text)
+                                if '|' in text:
+                                    device_parts = text.split('|')
+                                    for part in device_parts:
+                                        part = part.strip()
+                                        if part:
+                                            for pattern in DEVICE_PATTERNS:
+                                                if pattern.match(part):
+                                                    if part not in devices:
+                                                        devices[part] = {
+                                                            'id': part,
+                                                            'position': attrib_position,
+                                                            'layer': layer,
+                                                            'source': 'ATTRIB',
+                                                            'text': part,
+                                                            'block': block_name,
+                                                            'ports': {}
+                                                        }
+                                                    break
+                            
+                            elif tag in ('PROD_MFG_NAME_DISPLAY', 'MANUFACTURER', 'MFG', 'manufacturer'):
+                                # This is a manufacturer
+                                manufacturer = text
+                            
+                            elif tag in ('PROD_MODEL', 'MODEL', 'model'):
+                                # This is a model
+                                model = text
+                            
+                            elif tag in ('RACK_NAME-RACK_POSITION', 'RACK'):
+                                # This is a rack position
+                                rack_position = text
+                            
+                            elif tag in ('CONN_NAME', 'CONN_NAME_', 'PORT', 'port'):
+                                # This is a connector/port type
+                                conn_name = text
+                            
+                            elif tag in ('LINE_TEXT', 'LINE_TEXT_', 'PORT_NAME', 'port'):
+                                # This is port label text
+                                port_texts.append(text)
+                            
+                            # Check for jack positions in patch panels
+                            elif tag in ('JACK_ROW', 'JACK_ROW_', 'JACK_COLUMN', 'JACK_COLUMN_'):
+                                # Store jack information for patch panels
+                                jack_entry = {
+                                    'device_id': device_id,
+                                    'position': attrib_position,
+                                    'tag': tag,
+                                    'text': text,
+                                    'block': block_name
+                                }
+                                jack_entries.append(jack_entry)
+                            
+                            # Check for cable IDs
+                            if is_cable_id(text):
+                                cable_type = "UNKNOWN"
+                                for ctype, pattern in CABLE_ID_PATTERNS.items():
+                                    if pattern.match(text):
+                                        cable_type = ctype
+                                        break
+                                
+                                cable_ids[text] = {
+                                    'id': text,
+                                    'position': attrib_position,
+                                    'layer': layer,
+                                    'type': cable_type,
+                                    'block': block_name
+                                }
+                        except Exception as e:
+                            logger.debug(f"Error processing attribute: {str(e)}")
+                
+                # Now update device info with collected attributes
+                if device_id and device_id in devices:
+                    if manufacturer:
+                        devices[device_id]['manufacturer'] = manufacturer
+                    if model:
+                        devices[device_id]['model'] = model
+                    if rack_position:
+                        devices[device_id]['rack_position'] = rack_position
+                    
+                    # Add ports if we have connector info
+                    if conn_name and port_texts:
+                        for port_text in port_texts:
+                            port_name = f"{conn_name} {port_text}"
+                            devices[device_id]['ports'][port_name] = {
+                                'name': port_name,
+                                'position': block_position,
+                                'connector_type': conn_name,
+                                'text': port_text
+                            }
+            except Exception as e:
+                logger.debug(f"Error processing block reference: {str(e)}")
+        
+        # Step 1.5: Process block-level device extraction 
+        logger.info("Processing block-level device extraction...")
+        process_device_blocks(block_attributes, devices)
+
+        # Process compound device names (e.g. 'FRX.01|FRX.02|FTRX.01')
+        logger.info("Processing compound device names...")
+        process_compound_device_names(devices, text_entities)
+        
+        # Step 2: Process jack entries for patch panels
+        logger.info("Processing patch panel jacks...")
+        
+        # Group jack entries by block to organize patch panel connections
+        jack_by_block = defaultdict(list)
+        for entry in jack_entries:
+            jack_by_block[entry['block']].append(entry)
+        
+        # Process jack entries
+        for block, entries in jack_by_block.items():
+            # Try to find device ID for this block
+            device_id = None
+            for entry in entries:
+                if entry.get('device_id'):
+                    device_id = entry['device_id']
+                    break
+            
+            if not device_id:
+                continue
+                
+            # Group entries by their positions to associate rows/columns
+            positions = defaultdict(dict)
+            for entry in entries:
+                pos = entry['position']
+                tag = entry['tag']
+                text = entry['text']
+                
+                if tag.startswith('JACK_ROW'):
+                    positions[pos]['row'] = text
+                elif tag.startswith('JACK_COLUMN'):
+                    positions[pos]['column'] = text
+                    
+            # Create port entries for each jack position
+            for pos, data in positions.items():
+                if 'row' in data and 'column' in data:
+                    port_name = f"{data['row']} {data['column']}"
+                    if device_id in devices:
+                        devices[device_id]['ports'][port_name] = {
+                            'name': port_name,
+                            'position': pos,
+                            'row': data['row'],
+                            'column': data['column'],
+                            'text': f"{data['row']}{data['column']}"
+                        }                
+        
+        # Step 3: Extract connections from lines and polylines
+        logger.info("Extracting connections from lines and polylines...")
+        
+        # Process LWPOLYLINE entities (signal paths)
+        for entity in msp.query('LWPOLYLINE'):
+            try:
+                points = list(entity.vertices())
+                layer = entity.dxf.layer
+                
+                if len(points) < 2:
+                    continue
+                
+                start_point = tuple(points[0])  # Convert to tuple for consistency
+                end_point = tuple(points[-1])
+                
+                # Try to determine what's at each endpoint
+                source_info = identify_endpoint(start_point, devices, device_positions, text_entities)
+                dest_info = identify_endpoint(end_point, devices, device_positions, text_entities)
+                
+                # Find any cable IDs near the line
+                cable_found = False
+                nearby_cable = None
+                # Check all points along the polyline for cable IDs
+                for i in range(len(points) - 1):
+                    midpoint = calculate_midpoint(points[i], points[i+1])
+                    nearby_cable = find_nearest_cable_id(midpoint, cable_ids, 30.0)
+                    if nearby_cable:
+                        cable_found = True
+                        break
+                
+                # If we didn't find a cable by checking points, try other methods
+                if not cable_found:
+                    # Try the overall midpoint of the line
+                    midpoint = calculate_midpoint(start_point, end_point)
+                    nearby_cable = find_nearest_cable_id(midpoint, cable_ids, 30.0)
+                
+                # Determine signal type from layer name using the enhanced method
+                signal_type = derive_signal_type_from_layer(layer)
+                
+                # Only create connection if we found something at both ends
+                if source_info and dest_info and source_info != dest_info:
+                    connection = {
+                        'source': source_info,
+                        'destination': dest_info,
+                        'cable_id': nearby_cable if cable_found else None,
+                        'signal_type': signal_type,
+                        'layer': layer,
+                        'path': 'POLYLINE'
+                    }
+                    connections.append(connection)
+            except Exception as e:
+                logger.debug(f"Error processing LWPOLYLINE: {str(e)}")
+        
+        # Process LINE entities (direct connections)
+        for entity in msp.query('LINE'):
+            try:
+                start_point = (entity.dxf.start.x, entity.dxf.start.y)
+                end_point = (entity.dxf.end.x, entity.dxf.end.y)
+                layer = entity.dxf.layer
+                
+                # Try to determine what's at each endpoint
+                source_info = identify_endpoint(start_point, devices, device_positions, text_entities)
+                dest_info = identify_endpoint(end_point, devices, device_positions, text_entities)
+                
+                # Find any cable IDs near the line
+                midpoint = calculate_midpoint(start_point, end_point)
+                nearby_cable_id = find_nearest_cable_id(midpoint, cable_ids, 30.0)
+                
+                # Determine signal type from layer name using the enhanced method
+                signal_type = derive_signal_type_from_layer(layer)
+                
+                # Only create connection if we found something at both ends
+                if source_info and dest_info and source_info != dest_info:
+                    connection = {
+                        'source': source_info,
+                        'destination': dest_info,
+                        'cable_id': nearby_cable_id,
+                        'signal_type': signal_type,
+                        'layer': layer,
+                        'path': 'LINE'
+                    }
+                    connections.append(connection)
+            except Exception as e:
+                logger.debug(f"Error processing LINE: {str(e)}")
+        
+        # Step 4: Extract cable information from text placement
+        logger.info("Extracting cable connections from text placement...")
+        
+        # Process cable associations more accurately
+        process_cable_associations(devices, cable_ids)
+        
+        # Find cable IDs that are placed between devices/ports
+        for cable_id, cable_data in cable_ids.items():
+            cable_pos = cable_data['position']
+            
+            # Find nearby devices and ports
+            nearest_elements = []
+            
+            # Check devices
+            for device_id, device_data in devices.items():
+                device_pos = device_data['position']
+                dist = calculate_distance(cable_pos, device_pos)
+                
+                if dist < 50.0:  # Adjust this threshold as needed
+                    nearest_elements.append({
+                        'type': 'device',
+                        'id': device_id,
+                        'distance': dist,
+                        'position': device_pos
+                    })
+                
+                # Check device ports
+                for port_name, port_data in device_data.get('ports', {}).items():
+                    if 'position' in port_data:
+                        port_pos = port_data['position']
+                        dist = calculate_distance(cable_pos, port_pos)
+                        
+                        if dist < 30.0:  # Ports should be closer
+                            nearest_elements.append({
+                                'type': 'port',
+                                'device_id': device_id,
+                                'port_name': port_name,
+                                'distance': dist,
+                                'position': port_pos
+                            })
+            
+            # Sort by distance
+            nearest_elements.sort(key=lambda x: x['distance'])
+            
+            # If we have at least two elements, create a connection
+            if len(nearest_elements) >= 2:
+                source = nearest_elements[0]
+                dest = nearest_elements[1]
+                
+                source_info = None
+                dest_info = None
+                
+                if source['type'] == 'device':
+                    source_info = {'type': 'device', 'id': source['id']}
+                elif source['type'] == 'port':
+                    source_info = {
+                        'type': 'device',
+                        'id': source['device_id'],
+                        'port': source['port_name']
+                    }
+                
+                if dest['type'] == 'device':
+                    dest_info = {'type': 'device', 'id': dest['id']}
+                elif dest['type'] == 'port':
+                    dest_info = {
+                        'type': 'device',
+                        'id': dest['device_id'],
+                        'port': dest['port_name']
+                    }
+                
+                # Only create if we have valid source and dest
+                if source_info and dest_info:
+                    # Determine signal type based on cable ID
+                    signal_type = cable_data.get('type', 'UNKNOWN')
+                    
+                    # Check if this connection already exists
+                    connection_exists = False
+                    for conn in connections:
+                        if (conn.get('source') == source_info and conn.get('destination') == dest_info) or \
+                           (conn.get('source') == dest_info and conn.get('destination') == source_info):
+                            # Update existing connection with cable ID if it doesn't have one
+                            if not conn.get('cable_id') and cable_id:
+                                conn['cable_id'] = cable_id
+                            connection_exists = True
+                            break
+                    
+                    # Create new connection if it doesn't exist
+                    if not connection_exists:
+                        connection = {
+                            'source': source_info,
+                            'destination': dest_info,
+                            'cable_id': cable_id,
+                            'signal_type': signal_type,
+                            'layer': cable_data.get('layer', 'UNKNOWN'),
+                            'path': 'TEXT_PLACEMENT'
+                        }
+                        connections.append(connection)
+        
+        # Step A: Building cable journal
+        logger.info("Building cable journal from connections...")
+        
+        cable_journal = []
+        
+        for conn in connections:
+            source_info = conn.get('source', {})
+            dest_info = conn.get('destination', {})
+            
+            if source_info.get('type') == 'device' and dest_info.get('type') == 'device':
+                source_id = source_info.get('id')
+                dest_id = dest_info.get('id')
+                
+                if source_id and dest_id:
+                    # Get source device details
+                    source_device = devices.get(source_id, {})
+                    source_port = source_info.get('port', '')
+                    
+                    # Get destination device details
+                    dest_device = devices.get(dest_id, {})
+                    dest_port = dest_info.get('port', '')
+                    
+                    # Create journal entry
+                    entry = {
+                        'cable_id': conn.get('cable_id', ''),
+                        'source_device': source_id,
+                        'source_manufacturer': source_device.get('manufacturer', ''),
+                        'source_model': source_device.get('model', ''),
+                        'source_rack_position': source_device.get('rack_position', ''),
+                        'source_port': source_port,
+                        'destination_device': dest_id,
+                        'destination_manufacturer': dest_device.get('manufacturer', ''),
+                        'destination_model': dest_device.get('model', ''),
+                        'destination_rack_position': dest_device.get('rack_position', ''),
+                        'destination_port': dest_port,
+                        'signal_type': conn.get('signal_type', 'UNKNOWN')
+                    }
+                    
+                    # Add to journal if it has at least source and destination
+                    if entry['source_device'] and entry['destination_device']:
+                        cable_journal.append(entry)
+        
+        # Prepare final output
+        schematic_data = {
+            'devices': [devices[device_id] for device_id in devices],
+            'connections': connections,
+            'cable_journal': cable_journal,
+            'file_path': dxf_file_path,
+            'filename': os.path.basename(dxf_file_path)
+        }
+        
+        return schematic_data
+    
+    except Exception as e:
+        logger.error(f"Error extracting schematic data: {str(e)}")
+        return None
+
+def generate_svg_from_dxf(dxf_file_path, output_path):
+    """Generate SVG representation of the DXF file"""
+    try:
+        import ezdxf
+        from ezdxf.addons.drawing import Frontend, RenderContext
+        from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+        import matplotlib.pyplot as plt
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        
+        # Load DXF
+        doc = ezdxf.readfile(dxf_file_path)
+        msp = doc.modelspace()
+        
+        # Setup matplotlib renderer
+        fig = plt.figure(figsize=(30, 20))
+        ax = fig.add_axes([0, 0, 1, 1])
+        ctx = RenderContext(doc)
+        out = MatplotlibBackend(ax)
+        Frontend(ctx, out).draw_layout(msp, finalize=True)
+        
+        # Save as SVG first
+        temp_svg = output_path.replace('.json', '.svg')
+        fig.savefig(temp_svg, format='svg')
+        plt.close(fig)
+        
+        logger.info(f"Generated SVG representation: {temp_svg}")
+        return temp_svg
+    except Exception as e:
+        logger.error(f"Error generating SVG: {str(e)}")
+        return None 
+
+def process_dxf_file(dxf_path, output_path=None, generate_markdown=False, generate_svg=False, visual_json=False):
+    """Process a DXF file and save results as JSON"""
+    if output_path is None:
+        output_path = os.path.splitext(dxf_path)[0] + '.json'
+    
+    logger.info(f"Processing {dxf_path}, will save to {output_path}")
+    
+    schematic_data = extract_broadcast_schematic(dxf_path)
+    
+    # Add visual elements if requested
+    if visual_json and schematic_data:
+        schematic_data = extract_visual_elements(dxf_path, schematic_data)
+    
+    # Generate SVG if requested
+    if generate_svg and schematic_data:
+        svg_path = generate_svg_from_dxf(dxf_path, output_path)
+        if svg_path:
+            schematic_data['svg_representation'] = svg_path
+    
+    if schematic_data:
+        try:
+            # Save the full data as JSON
+            with open(output_path, 'w') as f:
+                json.dump(schematic_data, f, indent=2)
+            logger.info(f"Successfully saved schematic data to {output_path}")
+            
+            # Optionally generate a markdown cable journal
+            if generate_markdown:
+                markdown = generate_markdown_cable_journal(schematic_data.get('cable_journal', []))
+                markdown_path = os.path.splitext(dxf_path)[0] + '_cable_journal.md'
+                
+                with open(markdown_path, 'w') as f:
+                    f.write(markdown)
+                
+                logger.info(f"Generated markdown cable journal: {markdown_path}")
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error saving output: {str(e)}")
+            return False
+    else:
+        logger.error(f"Failed to extract data from {dxf_path}")
+        return False
+
+def generate_markdown_cable_journal(cable_journal):
+    """Generate a markdown table representation of the cable journal"""
+    if not cable_journal:
+        return "No cable journal entries found."
+    
+    markdown = "# Cable Journal\n\n"
+    markdown += "| Cable ID | Source Device | Source Port | Destination Device | Destination Port | Signal Type |\n"
+    markdown += "|----------|--------------|-------------|-------------------|-----------------|------------|\n"
+    
+    # Sort by cable ID for a more organized presentation
+    sorted_entries = sorted(cable_journal, key=lambda x: x.get('cable_id', ''))
+    
+    for entry in sorted_entries:
+        markdown += f"| {entry.get('cable_id', '')} | {entry.get('source_device', '')} | {entry.get('source_port', '')} | "
+        markdown += f"{entry.get('destination_device', '')} | {entry.get('destination_port', '')} | {entry.get('signal_type', '')} |\n"
+    
+    # Add summary statistics
+    markdown += f"\n\n## Summary\n\n"
+    markdown += f"Total connections: {len(cable_journal)}\n\n"
+    
+    # Count by signal type
+    signal_types = {}
+    for entry in cable_journal:
+        signal_type = entry.get('signal_type', 'UNKNOWN')
+        signal_types[signal_type] = signal_types.get(signal_type, 0) + 1
+    
+    markdown += "### Connections by Signal Type\n\n"
+    for signal_type, count in sorted(signal_types.items(), key=lambda x: x[1], reverse=True):
+        markdown += f"- {signal_type}: {count}\n"
+    
+    return markdown
+
+    
+
+def export_cable_journal_csv(cable_journal, output_path):
+    """Export the cable journal to a CSV file"""
+    import csv
+    
+    with open(output_path, 'w', newline='') as csvfile:
+        fieldnames = [
+            'cable_id', 
+            'source_device', 'source_manufacturer', 'source_model', 'source_rack_position', 'source_port',
+            'destination_device', 'destination_manufacturer', 'destination_model', 'destination_rack_position', 'destination_port',
+            'signal_type'
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        writer.writeheader()
+        for entry in sorted(cable_journal, key=lambda x: x.get('cable_id', '')):
+            writer.writerow(entry)
+    
+    logger.info(f"Cable journal exported to CSV: {output_path}")
+    return True
+
+def generate_visualizations(schematic_data, output_dir=None):
+    """Generate visualizations of the schematic data"""
+    try:
+        import matplotlib.pyplot as plt
+        import networkx as nx
+        from matplotlib.patches import Patch
+    except ImportError:
+        logger.warning("Visualization libraries not available. Please install matplotlib and networkx.")
+        return False
+    
+    if output_dir is None:
+        output_dir = '.'
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a graph of devices and connections
+    G = nx.Graph()
+    
+    # Add devices as nodes
+    device_types = {}
+    for device in schematic_data.get('devices', []):
+        device_id = device.get('id')
+        if not device_id:
+            continue
+            
+        # Extract device type from ID (e.g., CCU.01 -> CCU)
+        device_type = device_id.split('.')[0] if '.' in device_id else device_id
+        device_types[device_id] = device_type
+        
+        # Add node with attributes
+        G.add_node(device_id, 
+                   type=device_type,
+                   manufacturer=device.get('manufacturer'),
+                   model=device.get('model'),
+                   position=device.get('position'))
+    
+    # Add connections as edges
+    for conn in schematic_data.get('connections', []):
+        source = conn.get('source', {})
+        dest = conn.get('destination', {})
+        
+        if source.get('type') == 'device' and dest.get('type') == 'device':
+            source_id = source.get('id')
+            dest_id = dest.get('id')
+            
+            if source_id and dest_id and source_id in G and dest_id in G:
+                G.add_edge(source_id, dest_id, 
+                           cable_id=conn.get('cable_id'),
+                           signal_type=conn.get('signal_type'),
+                           source_port=source.get('port'),
+                           dest_port=dest.get('port'))
+    
+    # Create color map for device types
+    unique_types = set(device_types.values())
+    color_map = {}
+    colors = plt.cm.tab20.colors
+    for i, device_type in enumerate(unique_types):
+        color_map[device_type] = colors[i % len(colors)]
+    
+    # Set node colors based on device type
+    node_colors = [color_map.get(device_types.get(node), 'gray') for node in G.nodes()]
+    
+    # Draw the graph
+    plt.figure(figsize=(14, 10))
+    pos = nx.spring_layout(G, k=0.3, iterations=50)
+    
+    nx.draw_networkx_nodes(G, pos, node_size=300, node_color=node_colors, alpha=0.8)
+    nx.draw_networkx_labels(G, pos, font_size=8, font_family='sans-serif')
+    nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.5)
+    
+    # Create legend
+    legend_elements = [Patch(facecolor=color_map[t], label=t) for t in unique_types]
+    plt.legend(handles=legend_elements, loc='upper right')
+    
+    plt.title('Device Connectivity Graph')
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # Save visualization
+    graph_path = os.path.join(output_dir, 'device_connectivity.png')
+    plt.savefig(graph_path, dpi=300)
+    plt.close()
+    
+    # Generate signal type distribution chart
+    signal_types = {}
+    for conn in schematic_data.get('connections', []):
+        signal_type = conn.get('signal_type', 'UNKNOWN')
+        signal_types[signal_type] = signal_types.get(signal_type, 0) + 1
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(signal_types.keys(), signal_types.values())
+    
+    plt.title('Signal Type Distribution')
+    plt.xlabel('Signal Type')
+    plt.ylabel('Count')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    
+    # Save signal type chart
+    signal_chart_path = os.path.join(output_dir, 'signal_types.png')
+    plt.savefig(signal_chart_path, dpi=300)
+    plt.close()
+    
+    return True
+
+def generate_interactive_html(schematic_data, output_path):
+    """Generate an interactive HTML visualization of the schematic using the enhanced visual data"""
+    try:
+        # Create base HTML file with custom visualization
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Broadcast Schematic Visualization</title>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+            <style>
+                body { margin: 0; font-family: Arial, sans-serif; }
+                
+                .container { display: flex; flex-direction: column; height: 100vh; }
+                
+                .header {
+                    background-color: #333;
+                    color: white;
+                    padding: 10px;
+                    text-align: center;
+                }
+                
+                .content {
+                    display: flex;
+                    flex: 1;
+                    overflow: hidden;
+                }
+                
+                .sidebar {
+                    width: 300px;
+                    padding: 10px;
+                    background-color: #f0f0f0;
+                    overflow-y: auto;
+                    box-shadow: 2px 0 5px rgba(0,0,0,0.1);
+                }
+                
+                .main {
+                    flex: 1;
+                    overflow: hidden;
+                    position: relative;
+                }
+                
+                #schematic-view {
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                }
+                
+                .device {
+                    stroke: #000;
+                    stroke-width: 2px;
+                    cursor: pointer;
+                }
+                
+                .connection {
+                    stroke-width: 2px;
+                    fill: none;
+                }
+                
+                .port {
+                    fill: #555;
+                    stroke: #000;
+                    stroke-width: 1px;
+                }
+                
+                .device-label {
+                    font-size: 12px;
+                    font-weight: bold;
+                    text-anchor: middle;
+                    dominant-baseline: middle;
+                }
+                
+                .port-label {
+                    font-size: 8px;
+                    text-anchor: start;
+                }
+                
+                .cable-label {
+                    font-size: 8px;
+                    text-anchor: middle;
+                    dominant-baseline: middle;
+                    pointer-events: none;
+                }
+                
+                .tooltip {
+                    position: absolute;
+                    padding: 10px;
+                    background-color: white;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    pointer-events: none;
+                    z-index: 10;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                    display: none;
+                }
+                
+                #info-panel {
+                    border-top: 1px solid #ddd;
+                    padding-top: 10px;
+                    margin-top: 10px;
+                }
+                
+                .control-group {
+                    margin-bottom: 15px;
+                }
+                
+                .legend {
+                    display: flex;
+                    flex-wrap: wrap;
+                    margin-top: 10px;
+                }
+                
+                .legend-item {
+                    display: flex;
+                    align-items: center;
+                    margin-right: 15px;
+                    margin-bottom: 5px;
+                }
+                
+                .legend-color {
+                    width: 20px;
+                    height: 10px;
+                    margin-right: 5px;
+                }
+                
+                button, select {
+                    padding: 5px 10px;
+                    margin: 5px 0;
+                }
+                
+                h3 {
+                    margin-top: 15px;
+                    margin-bottom: 10px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h2 id="schematic-title">Broadcast Schematic Visualization</h2>
+                </div>
+                <div class="content">
+                    <div class="sidebar">
+                        <div class="control-group">
+                            <h3>Display Controls</h3>
+                            <button id="zoom-in">Zoom In (+)</button>
+                            <button id="zoom-out">Zoom Out (-)</button>
+                            <button id="reset-view">Reset View</button>
+                            <div style="margin-top: 10px;">
+                                <label for="signal-filter">Filter by Signal Type:</label>
+                                <select id="signal-filter">
+                                    <option value="all">All Signal Types</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="legend">
+                            <h3>Signal Types</h3>
+                            <div id="signal-legend"></div>
+                        </div>
+                        
+                        <div id="info-panel">
+                            <h3>Information</h3>
+                            <div id="selection-info">
+                                <p>Click on a device or connection for details.</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="main">
+                        <div id="schematic-view"></div>
+                        <div class="tooltip" id="tooltip"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <script>
+                // Will be filled with data
+                const schematicData = SCHEMATIC_DATA_PLACEHOLDER;
+                
+                // Set up the visualization
+                document.addEventListener('DOMContentLoaded', function() {
+                    // Set the title from metadata
+                    if (schematicData.metadata && schematicData.metadata.filename) {
+                        document.getElementById('schematic-title').textContent = 
+                            'Broadcast Schematic: ' + schematicData.metadata.filename;
+                    }
+                    
+                    // Set up signal type filter
+                    const signalFilter = document.getElementById('signal-filter');
+                    const signalTypes = new Set();
+                    
+                    // Get unique signal types
+                    schematicData.connections.forEach(conn => {
+                        if (conn.signal_type) {
+                            signalTypes.add(conn.signal_type);
+                        }
+                    });
+                    
+                    // Add options to filter dropdown
+                    Array.from(signalTypes).sort().forEach(type => {
+                        const option = document.createElement('option');
+                        option.value = type;
+                        option.textContent = type;
+                        signalFilter.appendChild(option);
+                    });
+                    
+                    // Set up the legend
+                    const legend = document.getElementById('signal-legend');
+                    if (schematicData.color_map) {
+                        Object.entries(schematicData.color_map).forEach(([type, color]) => {
+                            const item = document.createElement('div');
+                            item.className = 'legend-item';
+                            
+                            const colorBox = document.createElement('div');
+                            colorBox.className = 'legend-color';
+                            colorBox.style.backgroundColor = color;
+                            
+                            const label = document.createElement('span');
+                            label.textContent = type;
+                            
+                            item.appendChild(colorBox);
+                            item.appendChild(label);
+                            legend.appendChild(item);
+                        });
+                    }
+                    
+                    // Set up the SVG
+                    const container = document.getElementById('schematic-view');
+                    const svg = d3.select(container).append('svg')
+                        .attr('width', '100%')
+                        .attr('height', '100%')
+                        .attr('preserveAspectRatio', 'xMidYMid meet');
+                    
+                    // Add a group for zoom behavior
+                    const g = svg.append('g');
+                    
+                    // Set up zoom behavior
+                    const zoom = d3.zoom()
+                        .scaleExtent([0.1, 10])
+                        .on('zoom', (event) => {
+                            g.attr('transform', event.transform);
+                        });
+                    
+                    svg.call(zoom);
+                    
+                    // Calculate bounds for initial view
+                    const bounds = schematicData.visual_bounds || {
+                        min_x: 0, max_x: 1000, min_y: 0, max_y: 800
+                    };
+                    
+                    const width = container.clientWidth;
+                    const height = container.clientHeight;
+                    
+                    const schematicWidth = bounds.max_x - bounds.min_x;
+                    const schematicHeight = bounds.max_y - bounds.min_y;
+                    
+                    // Set the viewBox to fit all content
+                    svg.attr('viewBox', `${bounds.min_x - 100} ${bounds.min_y - 100} ${schematicWidth + 200} ${schematicHeight + 200}`);
+                    
+                    // Draw connections
+                    const connectionsGroup = g.append('g').attr('class', 'connections');
+                    
+                    schematicData.connections.forEach(conn => {
+                        if (conn.visual && conn.visual.line) {
+                            const color = conn.visual.color || schematicData.color_map[conn.signal_type] || '#ccc';
+                            
+                            // Create the path
+                            const path = connectionsGroup.append('path')
+                                .attr('class', 'connection')
+                                .attr('stroke', color)
+                                .attr('data-signal-type', conn.signal_type || 'UNKNOWN')
+                                .attr('id', `conn-${conn.source?.id || 'unknown'}-${conn.destination?.id || 'unknown'}`);
+                            
+                            // Set the path data
+                            const line = d3.line()
+                                .x(d => d.x)
+                                .y(d => d.y)
+                                .curve(d3.curveLinear);
+                            
+                            path.attr('d', line(conn.visual.line));
+                            
+                            // Add event listeners
+                            path.on('mouseover', function(event) {
+                                const tooltip = document.getElementById('tooltip');
+                                tooltip.style.left = (event.pageX + 10) + 'px';
+                                tooltip.style.top = (event.pageY + 10) + 'px';
+                                
+                                let content = '';
+                                if (conn.cable_id) content += `<strong>Cable:</strong> ${conn.cable_id}<br>`;
+                                if (conn.signal_type) content += `<strong>Type:</strong> ${conn.signal_type}<br>`;
+                                
+                                if (conn.source && conn.source.id) {
+                                    content += `<strong>From:</strong> ${conn.source.id}`;
+                                    if (conn.source.port) content += ` (${conn.source.port})`;
+                                    content += '<br>';
+                                }
+                                
+                                if (conn.destination && conn.destination.id) {
+                                    content += `<strong>To:</strong> ${conn.destination.id}`;
+                                    if (conn.destination.port) content += ` (${conn.destination.port})`;
+                                    content += '<br>';
+                                }
+                                
+                                tooltip.innerHTML = content;
+                                tooltip.style.display = 'block';
+                                
+                                // Highlight path on hover
+                                d3.select(this).attr('stroke-width', 4);
+                            })
+                            .on('mouseout', function() {
+                                document.getElementById('tooltip').style.display = 'none';
+                                d3.select(this).attr('stroke-width', 2);
+                            })
+                            .on('click', function() {
+                                const infoPanel = document.getElementById('selection-info');
+                                let html = '<h4>Connection Details</h4>';
+                                
+                                if (conn.cable_id) html += `<p><strong>Cable ID:</strong> ${conn.cable_id}</p>`;
+                                if (conn.signal_type) html += `<p><strong>Signal Type:</strong> ${conn.signal_type}</p>`;
+                                
+                                if (conn.source && conn.source.id) {
+                                    html += `<p><strong>Source:</strong> ${conn.source.id}`;
+                                    if (conn.source.port) html += ` (${conn.source.port})`;
+                                    html += '</p>';
+                                }
+                                
+                                if (conn.destination && conn.destination.id) {
+                                    html += `<p><strong>Destination:</strong> ${conn.destination.id}`;
+                                    if (conn.destination.port) html += ` (${conn.destination.port})`;
+                                    html += '</p>';
+                                }
+                                
+                                if (conn.layer) html += `<p><strong>Layer:</strong> ${conn.layer}</p>`;
+                                
+                                infoPanel.innerHTML = html;
+                            });
+                            
+                            // Add cable labels
+                            if (conn.cable_id) {
+                                // Calculate midpoint for the label
+                                const midPoint = {
+                                    x: (conn.visual.line[0].x + conn.visual.line[conn.visual.line.length-1].x) / 2,
+                                    y: (conn.visual.line[0].y + conn.visual.line[conn.visual.line.length-1].y) / 2
+                                };
+                                
+                                connectionsGroup.append('text')
+                                    .attr('class', 'cable-label')
+                                    .attr('x', midPoint.x)
+                                    .attr('y', midPoint.y)
+                                    .attr('dy', -5)
+                                    .attr('data-signal-type', conn.signal_type || 'UNKNOWN')
+                                    .text(conn.cable_id);
+                            }
+                        }
+                    });
+                    
+                    // Draw polylines for more complex connections
+                    if (schematicData.polylines && schematicData.polylines.length) {
+                        schematicData.polylines.forEach(polyline => {
+                            if (polyline.points && polyline.points.length > 1) {
+                                const color = polyline.color || schematicData.color_map[polyline.signal_type] || '#ccc';
+                                
+                                // Create the path
+                                const path = connectionsGroup.append('path')
+                                    .attr('class', 'connection')
+                                    .attr('stroke', color)
+                                    .attr('data-signal-type', polyline.signal_type || 'UNKNOWN');
+                                
+                                // Set the path data
+                                const line = d3.line()
+                                    .x(d => d.x)
+                                    .y(d => d.y)
+                                    .curve(d3.curveLinear);
+                                
+                                path.attr('d', line(polyline.points));
+                            }
+                        });
+                    }
+                    
+                    // Draw devices
+                    const devicesGroup = g.append('g').attr('class', 'devices');
+                    
+                    schematicData.devices.forEach(device => {
+                        if (device.visual || device.position) {
+                            const visual = device.visual || {};
+                            const x = visual.x || device.position[0];
+                            const y = visual.y || device.position[1];
+                            const width = visual.width || 100;
+                            const height = visual.height || 60;
+                            
+                            // Create device group
+                            const deviceGroup = devicesGroup.append('g')
+                                .attr('class', 'device-group')
+                                .attr('id', `device-${device.id}`);
+                            
+                            // Add device rectangle
+                            const deviceRect = deviceGroup.append('rect')
+                                .attr('class', 'device')
+                                .attr('x', x)
+                                .attr('y', y)
+                                .attr('width', width)
+                                .attr('height', height)
+                                .attr('rx', 5)
+                                .attr('ry', 5)
+                                .attr('fill', '#e0e0ff');
+                            
+                            // Add device label
+                            deviceGroup.append('text')
+                                .attr('class', 'device-label')
+                                .attr('x', x + width/2)
+                                .attr('y', y + 15)
+                                .text(device.id);
+                            
+                            // Add manufacturer/model if available
+                            if (device.manufacturer || device.model) {
+                                deviceGroup.append('text')
+                                    .attr('class', 'port-label')
+                                    .attr('x', x + 5)
+                                    .attr('y', y + 28)
+                                    .text(`${device.manufacturer || ''} ${device.model || ''}`);
+                            }
+                            
+                            // Add rack position if available
+                            if (device.rack_position) {
+                                deviceGroup.append('text')
+                                    .attr('class', 'port-label')
+                                    .attr('x', x + 5)
+                                    .attr('y', y + 40)
+                                    .text(device.rack_position);
+                            }
+                            
+                            // Add ports
+                            let portY = y + 50;
+                            Object.entries(device.ports || {}).forEach(([portName, portData]) => {
+                                if (portY < y + height - 5) {
+                                    deviceGroup.append('text')
+                                        .attr('class', 'port-label')
+                                        .attr('x', x + 5)
+                                        .attr('y', portY)
+                                        .text(portName);
+                                    
+                                    portY += 10;
+                                }
+                            });
+                            
+                            // Add event listeners
+                            deviceRect
+                                .on('mouseover', function(event) {
+                                    const tooltip = document.getElementById('tooltip');
+                                    tooltip.style.left = (event.pageX + 10) + 'px';
+                                    tooltip.style.top = (event.pageY + 10) + 'px';
+                                    
+                                    let content = `<strong>Device:</strong> ${device.id}<br>`;
+                                    if (device.manufacturer) content += `<strong>Manufacturer:</strong> ${device.manufacturer}<br>`;
+                                    if (device.model) content += `<strong>Model:</strong> ${device.model}<br>`;
+                                    if (device.rack_position) content += `<strong>Rack Position:</strong> ${device.rack_position}<br>`;
+                                    
+                                    tooltip.innerHTML = content;
+                                    tooltip.style.display = 'block';
+                                    
+                                    // Highlight on hover
+                                    d3.select(this).attr('stroke-width', 3);
+                                })
+                                .on('mouseout', function() {
+                                    document.getElementById('tooltip').style.display = 'none';
+                                    d3.select(this).attr('stroke-width', 2);
+                                })
+                                .on('click', function() {
+                                    const infoPanel = document.getElementById('selection-info');
+                                    let html = `<h4>Device: ${device.id}</h4>`;
+                                    
+                                    if (device.manufacturer) html += `<p><strong>Manufacturer:</strong> ${device.manufacturer}</p>`;
+                                    if (device.model) html += `<p><strong>Model:</strong> ${device.model}</p>`;
+                                    if (device.rack_position) html += `<p><strong>Rack Position:</strong> ${device.rack_position}</p>`;
+                                    
+                                    html += '<h5>Ports:</h5><ul>';
+                                    Object.entries(device.ports || {}).forEach(([portName, portData]) => {
+                                        html += `<li>${portName}`;
+                                        if (portData.cable_id) {
+                                            html += ` - Cable: ${portData.cable_id}`;
+                                        }
+                                        html += '</li>';
+                                    });
+                                    html += '</ul>';
+                                    
+                                    infoPanel.innerHTML = html;
+                                });
+                        }
+                    });
+                    
+                    // Set up filter by signal type
+                    signalFilter.addEventListener('change', function() {
+                        const selectedType = this.value;
+                        
+                        if (selectedType === 'all') {
+                            // Show all connections
+                            d3.selectAll('.connection, .cable-label').style('visibility', 'visible');
+                        } else {
+                            // Filter by selected signal type
+                            d3.selectAll('.connection, .cable-label').style('visibility', function() {
+                                return d3.select(this).attr('data-signal-type') === selectedType ? 'visible' : 'hidden';
+                            });
+                        }
+                    });
+                    
+                    // Set up zoom controls
+                    document.getElementById('zoom-in').addEventListener('click', function() {
+                        svg.transition().call(zoom.scaleBy, 1.2);
+                    });
+                    
+                    document.getElementById('zoom-out').addEventListener('click', function() {
+                        svg.transition().call(zoom.scaleBy, 0.8);
+                    });
+                    
+                    document.getElementById('reset-view').addEventListener('click', function() {
+                        svg.transition().call(zoom.transform, d3.zoomIdentity);
+                    });
+                });
+            </script>
+        </body>
+        </html>
+        """
+        
+        # Insert the schematic data
+        import json
+        schematic_json = json.dumps(schematic_data)
+        html_content = html_content.replace('SCHEMATIC_DATA_PLACEHOLDER', schematic_json)
+        
+        # Write the HTML file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        logger.info(f"Interactive visualization saved to {output_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error generating interactive HTML: {str(e)}")
+        return False
+
+def generate_pdf_schematic(schematic_data, output_path):
+    """Generate a PDF visualization mimicking the original schematic"""
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A3, landscape
+        from reportlab.lib import colors
+        import math
+        
+        # Create PDF canvas
+        c = canvas.Canvas(output_path, pagesize=landscape(A3))
+        width, height = landscape(A3)
+        
+        # Set up coordinate system (from bottom left)
+        c.translate(50, 50)  # Margins
+        
+        # Draw title block
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(width-300, height-70, f"Project: {schematic_data.get('filename', 'Broadcast Schematic')}")
+        c.setFont("Helvetica", 12)
+        c.drawString(width-300, height-90, f"Date: {schematic_data.get('export_date', 'N/A')}")
+        
+        # Draw devices as boxes
+        devices = schematic_data.get('devices', [])
+        device_positions = {}
+        
+        for device in devices:
+            device_id = device.get('id', '')
+            pos = device.get('position', (0, 0))
+            
+            # Scale positions to fit on PDF
+            x = pos[0] / 10 + 100
+            y = pos[1] / 10 + 100
+            device_positions[device_id] = (x, y)
+            
+            # Draw box for device
+            box_width = 100
+            box_height = 60
+            c.setStrokeColor(colors.blue)
+            c.rect(x, y, box_width, box_height)
+            
+            # Draw device label
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(x+5, y+box_height-10, device_id)
+            
+            # Draw model info if available
+            if 'manufacturer' in device and 'model' in device:
+                c.setFont("Helvetica", 6)
+                c.drawString(x+5, y+box_height-20, f"{device.get('manufacturer', '')} {device.get('model', '')}")
+            
+            # Draw ports
+            ports = device.get('ports', {})
+            port_y = y + box_height - 30
+            for port_name, port_data in ports.items():
+                c.setFont("Helvetica", 6)
+                c.drawString(x+5, port_y, port_name)
+                port_y -= 8
+                if port_y < y + 5:  # If we run out of space
+                    break
+        
+        # Draw connections
+        connections = schematic_data.get('connections', [])
+        for conn in connections:
+            source = conn.get('source', {})
+            dest = conn.get('destination', {})
+            
+            if source.get('type') == 'device' and dest.get('type') == 'device':
+                source_id = source.get('id')
+                dest_id = dest.get('id')
+                
+                if source_id in device_positions and dest_id in device_positions:
+                    # Get positions
+                    x1, y1 = device_positions[source_id]
+                    x2, y2 = device_positions[dest_id]
+                    
+                    # Adjust for box size
+                    x1 += 100  # Right side of source box
+                    y1 += 30   # Middle of source box
+                    x2 += 0    # Left side of destination box
+                    y2 += 30   # Middle of destination box
+                    
+                    # Set line properties based on signal type
+                    signal_type = conn.get('signal_type', 'UNKNOWN')
+                    if signal_type == 'SDI':
+                        c.setStrokeColor(colors.yellow)
+                    elif signal_type == 'HDMI':
+                        c.setStrokeColor(colors.red)
+                    elif signal_type == 'FIBER':
+                        c.setStrokeColor(colors.blue)
+                    elif signal_type == 'HYBRID':
+                        c.setStrokeColor(colors.green)
+                    else:
+                        c.setStrokeColor(colors.gray)
+                    
+                    # Draw line
+                    c.line(x1, y1, x2, y2)
+                    
+                    # Draw cable ID if available
+                    if conn.get('cable_id'):
+                        mid_x = (x1 + x2) / 2
+                        mid_y = (y1 + y2) / 2
+                        c.setFont("Helvetica", 6)
+                        c.drawString(mid_x, mid_y, conn.get('cable_id'))
+        
+        # Draw a legend
+        legend_x = width - 300
+        legend_y = 100
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(legend_x, legend_y, "Signal Types:")
+        legend_y -= 15
+        
+        # SDI
+        c.setStrokeColor(colors.yellow)
+        c.line(legend_x, legend_y, legend_x+20, legend_y)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 8)
+        c.drawString(legend_x+25, legend_y, "SDI")
+        legend_y -= 15
+        
+        # HDMI
+        c.setStrokeColor(colors.red)
+        c.line(legend_x, legend_y, legend_x+20, legend_y)
+        c.setFillColor(colors.black)
+        c.drawString(legend_x+25, legend_y, "HDMI")
+        legend_y -= 15
+        
+        # FIBER
+        c.setStrokeColor(colors.blue)
+        c.line(legend_x, legend_y, legend_x+20, legend_y)
+        c.setFillColor(colors.black)
+        c.drawString(legend_x+25, legend_y, "FIBER")
+        legend_y -= 15
+        
+        # HYBRID
+        c.setStrokeColor(colors.green)
+        c.line(legend_x, legend_y, legend_x+20, legend_y)
+        c.setFillColor(colors.black)
+        c.drawString(legend_x+25, legend_y, "HYBRID")
+        
+        # Finalize the PDF
+        c.save()
+        logger.info(f"PDF schematic generated: {output_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error generating PDF schematic: {str(e)}")
+        return False
+
+def export_virtual_model(schematic_data, output_path):
+    """Export a 3D virtual model of the system in glTF format"""
+    try:
+        import numpy as np
+        import pygltflib
+        from pygltflib import GLTF2, Node, Scene, Mesh
+        
+        # Create 3D model
+        gltf = GLTF2()
+        gltf.scenes.append(Scene())
+        
+        # Position everything in 3D space
+        devices = schematic_data.get('devices', [])
+        device_indices = {}
+        
+        for i, device in enumerate(devices):
+            device_id = device.get('id', '')
+            pos = device.get('position', (0, 0))
+            
+            # Create a node for this device
+            node = Node(
+                name=device_id,
+                translation=[pos[0]/100, pos[1]/100, 0],  # Scale down and place on XY plane
+                mesh=i  # Each device gets its own mesh
+            )
+            
+            gltf.nodes.append(node)
+            device_indices[device_id] = len(gltf.nodes) - 1
+            
+            # TODO: Add actual mesh creation code for device boxes
+            # This requires more complex 3D modeling code
+        
+        # Add connections
+        connections = schematic_data.get('connections', [])
+        for conn in connections:
+            source = conn.get('source', {})
+            dest = conn.get('destination', {})
+            
+            if source.get('type') == 'device' and dest.get('type') == 'device':
+                source_id = source.get('id')
+                dest_id = dest.get('id')
+                
+                if source_id in device_indices and dest_id in device_indices:
+                    # Create a connection line
+                    # TODO: Add actual connection line creation
+                    pass
+        
+        # Write the glTF file
+        gltf_path = output_path.replace('.json', '.gltf')
+        gltf.save(gltf_path)
+        logger.info(f"3D model exported to {gltf_path}")
+        return gltf_path
+    except ImportError:
+        logger.warning("pygltflib not available. 3D model export skipped.")
+        return None
+    except Exception as e:
+        logger.error(f"Error exporting 3D model: {str(e)}")
+        return None        
+
+def get_signal_color(signal_type):
+    """Return a color for a signal type"""
+    color_map = {
+        'SDI': '#e41a1c',          # Red
+        'FIBER': '#377eb8',        # Blue
+        'AUDIO': '#4daf4a',        # Green
+        'DIGITAL VIDEO': '#984ea3', # Purple
+        'CONTROL': '#ff7f00',      # Orange
+        'INTERCOM': '#ffff33',     # Yellow
+        'POWER': '#a65628',        # Brown
+        'RF': '#f781bf',           # Pink
+        'SYNC': '#999999',         # Grey
+        'HYBRID': '#8dd3c7',       # Mint
+        'UNKNOWN': '#bbbbbb'       # Light grey
+    }
+    return color_map.get(signal_type, '#bbbbbb')
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Extract data from broadcast engineering schematics')
+    parser.add_argument('dxf_file', help='Path to the DXF file to process (or directory of DXF files)')
+    parser.add_argument('-o', '--output', help='Path to save the output JSON file (or directory for multiple files)')
+    parser.add_argument('-m', '--markdown', action='store_true', help='Generate markdown cable journal')
+    parser.add_argument('-c', '--csv', action='store_true', help='Generate CSV cable journal')
+    parser.add_argument('-v', '--visualize', action='store_true', help='Generate visualizations')
+    parser.add_argument('-i', '--interactive', action='store_true', help='Generate interactive HTML visualization')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--svg', action='store_true', help='Generate SVG representation')
+    parser.add_argument('--pdf', action='store_true', help='Generate PDF schematic')
+    parser.add_argument('--visual-json', action='store_true', help='Include visual elements in JSON')
+    parser.add_argument('--3d', dest='three_d', action='store_true', help='Export 3D model')
+    
+    args = parser.parse_args()
+    
+    # Set up logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Process single file or directory
+    input_path = Path(args.dxf_file)
+    
+    if input_path.is_file() and input_path.suffix.lower() == '.dxf':
+        # Process single file
+        output_path = args.output
+        if not output_path:
+            output_path = str(input_path.with_suffix('.json'))
+    
+        success = process_dxf_file(
+            str(input_path), 
+            output_path, 
+            args.markdown, 
+            args.svg, 
+            args.visual_json
+        )
+    
+        if success:
+            # Load processed data
+            with open(output_path, 'r') as f:
+                schematic_data = json.load(f)
+        
+            output_dir = os.path.dirname(output_path)
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+        
+            # Generate CSV if requested
+            if args.csv:
+                csv_path = os.path.join(output_dir, f"{base_name}_cable_journal.csv")
+                export_cable_journal_csv(schematic_data.get('cable_journal', []), csv_path)
+        
+            # Generate visualizations if requested
+            if args.visualize:
+                generate_visualizations(schematic_data, output_dir)
+        
+            # Generate interactive HTML if requested
+            if args.interactive:
+                html_path = os.path.join(output_dir, f"{base_name}_interactive.html")
+                generate_interactive_html(schematic_data, html_path)
+            
+            # Generate PDF if requested
+            if args.pdf:
+                pdf_path = os.path.join(output_dir, f"{base_name}_schematic.pdf")
+                generate_pdf_schematic(schematic_data, pdf_path)
+            
+            # Generate 3D model if requested
+            if args.three_d:
+                export_virtual_model(schematic_data, output_path)
+    
+        sys.exit(0 if success else 1)
+        
+    elif input_path.is_dir():
+        # Process directory of DXF files
+        output_dir = args.output or str(input_path / 'json_output')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        dxf_files = list(input_path.glob('*.dxf'))
+        logger.info(f"Found {len(dxf_files)} DXF files to process")
+        
+        success_count = 0
+        for dxf_file in dxf_files:
+            output_path = Path(output_dir) / dxf_file.with_suffix('.json').name
+            if process_dxf_file(str(dxf_file), str(output_path), args.markdown):
+                success_count += 1
+                
+                # Load processed data for additional outputs
+                try:
+                    with open(output_path, 'r') as f:
+                        schematic_data = json.load(f)
+                    
+                    base_name = os.path.splitext(output_path.name)[0]
+                    
+                    # Generate CSV if requested
+                    if args.csv:
+                        csv_path = os.path.join(output_dir, f"{base_name}_cable_journal.csv")
+                        export_cable_journal_csv(schematic_data.get('cable_journal', []), csv_path)
+                    
+                    # Generate visualizations if requested
+                    if args.visualize:
+                        vis_dir = os.path.join(output_dir, 'visualizations')
+                        os.makedirs(vis_dir, exist_ok=True)
+                        generate_visualizations(schematic_data, vis_dir)
+                    
+                    # Generate interactive HTML if requested
+                    if args.interactive:
+                        html_path = os.path.join(output_dir, f"{base_name}_interactive.html")
+                        generate_interactive_html(schematic_data, html_path)
+                except Exception as e:
+                    logger.error(f"Error generating additional outputs for {output_path}: {str(e)}")
+        
+        logger.info(f"Successfully processed {success_count} of {len(dxf_files)} files")
+        sys.exit(0 if success_count > 0 else 1)
+        
+    else:
+        logger.error(f"Invalid input: {args.dxf_file} is not a DXF file or directory")
+        sys.exit(1)
