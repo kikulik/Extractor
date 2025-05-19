@@ -1,0 +1,240 @@
+import ezdxf
+import json
+import sys
+import os
+from pathlib import Path
+
+def dxf_to_json(dxf_file_path, output_json_path=None):
+    """
+    Extract data from a DXF file and convert it to JSON format.
+    
+    Args:
+        dxf_file_path (str): Path to the DXF file
+        output_json_path (str, optional): Path to save the JSON output. If None, 
+                                         uses the same name as the input file with .json extension
+    
+    Returns:
+        dict: The extracted data as a Python dictionary
+    """
+    try:
+        # Load the DXF file
+        doc = ezdxf.readfile(dxf_file_path)
+        
+        # Get the modelspace
+        msp = doc.modelspace()
+        
+        # Initialize data structure
+        dxf_data = {
+            "metadata": {
+                "filename": os.path.basename(dxf_file_path),
+                "version": str(doc.dxfversion),  # Convert to string to ensure serialization
+                "header_vars": {}
+            },
+            "entities": []
+        }
+        
+        # Extract header variables - fixed to handle HeaderSection properly
+        # The header in ezdxf is not directly iterable with items()
+        if hasattr(doc, 'header'):
+            header = doc.header
+            # Instead of iterating, try to access common header variables directly
+            common_header_vars = ['$ACADVER', '$HANDSEED', '$DWGCODEPAGE', '$INSUNITS']
+            
+            for var in common_header_vars:
+                try:
+                    if var in header:
+                        value = header[var]
+                        # Convert non-serializable types to strings
+                        if not isinstance(value, (str, int, float, bool, type(None), list, dict)):
+                            value = str(value)
+                        dxf_data["metadata"]["header_vars"][var] = value
+                except Exception as e:
+                    print(f"Error accessing header variable {var}: {e}")
+        
+        # Extract layers
+        dxf_data["layers"] = []
+        for layer in doc.layers:
+            try:
+                layer_data = {
+                    "name": layer.dxf.name,
+                    "color": layer.dxf.color,
+                    "linetype": layer.dxf.linetype
+                }
+                # These attributes might not be available in all DXF versions
+                try:
+                    layer_data["is_on"] = bool(layer.is_on)  # Convert to bool for serialization
+                    layer_data["is_locked"] = bool(layer.is_locked)  # Convert to bool for serialization
+                except AttributeError:
+                    # Handle older DXF versions that don't have these attributes
+                    pass
+                    
+                dxf_data["layers"].append(layer_data)
+            except Exception as e:
+                print(f"Error processing layer: {e}")
+        
+        # Extract all entities
+        for entity in msp:
+            try:
+                entity_type = entity.dxftype()
+                
+                # Basic properties all entities have
+                entity_data = {
+                    "type": entity_type,
+                    "handle": entity.dxf.handle,
+                }
+                
+                # Layer is a common attribute but let's handle possible exceptions
+                try:
+                    entity_data["layer"] = entity.dxf.layer
+                except AttributeError:
+                    pass
+                
+                # Extract specific properties based on entity type
+                if entity_type == "LINE":
+                    try:
+                        # Convert DXF entity properties to simple lists for JSON serialization
+                        entity_data.update({
+                            "start_point": [entity.dxf.start.x, entity.dxf.start.y, entity.dxf.start.z],
+                            "end_point": [entity.dxf.end.x, entity.dxf.end.y, entity.dxf.end.z],
+                        })
+                    except AttributeError as e:
+                        entity_data["error"] = f"Could not extract all LINE properties: {str(e)}"
+                        
+                elif entity_type == "CIRCLE":
+                    try:
+                        entity_data.update({
+                            "center": [entity.dxf.center.x, entity.dxf.center.y, entity.dxf.center.z],
+                            "radius": entity.dxf.radius,
+                        })
+                    except AttributeError as e:
+                        entity_data["error"] = f"Could not extract all CIRCLE properties: {str(e)}"
+                        
+                elif entity_type == "ARC":
+                    try:
+                        entity_data.update({
+                            "center": [entity.dxf.center.x, entity.dxf.center.y, entity.dxf.center.z],
+                            "radius": entity.dxf.radius,
+                            "start_angle": entity.dxf.start_angle,
+                            "end_angle": entity.dxf.end_angle,
+                        })
+                    except AttributeError as e:
+                        entity_data["error"] = f"Could not extract all ARC properties: {str(e)}"
+                        
+                elif entity_type == "TEXT":
+                    try:
+                        entity_data.update({
+                            "text": entity.dxf.text,
+                            "position": [entity.dxf.insert.x, entity.dxf.insert.y, entity.dxf.insert.z],
+                            "height": entity.dxf.height,
+                            "rotation": entity.dxf.rotation,
+                        })
+                    except AttributeError as e:
+                        entity_data["error"] = f"Could not extract all TEXT properties: {str(e)}"
+                        
+                elif entity_type == "POLYLINE" or entity_type == "LWPOLYLINE":
+                    try:
+                        points = []
+                        if entity_type == "LWPOLYLINE":
+                            try:
+                                # Get all points and convert to a simple list of [x,y] coordinates
+                                for point in entity.get_points():
+                                    points.append(list(point))
+                            except AttributeError:
+                                # Fall back to vertices for older DXF versions
+                                try:
+                                    for vertex in entity.vertices():
+                                        points.append([vertex.dxf.location.x, vertex.dxf.location.y, vertex.dxf.location.z])
+                                except:
+                                    pass
+                        else:
+                            try:
+                                for vertex in entity.vertices:
+                                    points.append([vertex.dxf.location.x, vertex.dxf.location.y, vertex.dxf.location.z])
+                            except:
+                                pass
+                        
+                        entity_data.update({
+                            "points": points,
+                        })
+                        
+                        # is_closed might not be available in all entity types
+                        try:
+                            entity_data["closed"] = bool(entity.is_closed)  # Convert to bool for serialization
+                        except AttributeError:
+                            pass
+                            
+                    except Exception as e:
+                        entity_data["error"] = f"Could not extract all POLYLINE properties: {str(e)}"
+                
+                # Add any other specific entity type handling here
+                # This is a more generic approach to handle unknown entities
+                else:
+                    try:
+                        # Try to get common attributes if they exist
+                        attrs = {}
+                        for attr_name in dir(entity.dxf):
+                            if not attr_name.startswith('_') and attr_name not in ['owner', 'handle', 'layer']:
+                                try:
+                                    value = getattr(entity.dxf, attr_name)
+                                    # Convert non-serializable types to strings or lists
+                                    if not isinstance(value, (str, int, float, bool, type(None), list, dict)):
+                                        if hasattr(value, '__iter__'):
+                                            value = list(value)
+                                        elif hasattr(value, 'x') and hasattr(value, 'y') and hasattr(value, 'z'):
+                                            # It's probably a point
+                                            value = [value.x, value.y, value.z]
+                                        else:
+                                            value = str(value)
+                                    attrs[attr_name] = value
+                                except Exception:
+                                    pass
+                        if attrs:
+                            entity_data["attributes"] = attrs
+                    except Exception:
+                        pass
+                
+                # Add the entity to our data structure
+                dxf_data["entities"].append(entity_data)
+            except Exception as e:
+                print(f"Error processing entity: {e}")
+        
+        # Determine output path if not provided
+        if output_json_path is None:
+            output_json_path = str(Path(dxf_file_path).with_suffix('.json'))
+        
+        # Custom JSON encoder to handle non-serializable objects
+        class CustomEncoder(json.JSONEncoder):
+            def default(self, obj):
+                try:
+                    # Try standard JSON serialization
+                    return json.JSONEncoder.default(self, obj)
+                except TypeError:
+                    # For any other type, convert to string
+                    return str(obj)
+        
+        # Write to JSON file with custom encoder
+        with open(output_json_path, 'w') as f:
+            json.dump(dxf_data, f, indent=2, cls=CustomEncoder)
+            
+        print(f"Successfully converted {dxf_file_path} to {output_json_path}")
+        return dxf_data
+        
+    except ezdxf.DXFError as e:
+        print(f"Error reading DXF file: {e}")
+        return None
+    except Exception as e:
+        print(f"Error during conversion: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return None
+
+if __name__ == "__main__":
+    # Simple command line interface
+    if len(sys.argv) < 2:
+        print("Usage: python export_dump_json.py input.dxf [output.json]")
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    dxf_to_json(input_file, output_file)
